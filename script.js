@@ -27,6 +27,7 @@ function goPg(name, btn) {
   document.getElementById('pg-' + name).classList.add('on');
   btn.classList.add('on');
   if (name === 'design') syncDP();
+  if (name === 'library') renderLibrary();
 }
 
 // ═══ GENRES ═══
@@ -351,7 +352,9 @@ function apDes(){
 }
 
 // ═══ AUTH + USER ═══
-let currentUser=null,saveTimer=null;
+let currentUser=null,saveTimer=null,currentProjectId=null;
+
+function newPid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 
 function doSignOut(){ksAuth.signOut().then(()=>window.location.replace('auth.html'));}
 
@@ -436,76 +439,214 @@ document.addEventListener('keydown',e=>{
 });
 
 // ═══ SAVE ═══
-const LS_KEY='ks_state_v1',LS_CV='ks_canvas_v1';
+const LS_KEY='ks_state_v2',LS_CV='ks_canvas_v2';
 
-function scheduleSave(){} // manual save only — tugmadan saqlanadi
+function scheduleSave(){} // manual save only
 
-async function doSave(btnEl){
-  saveC();
-  saveToLocal();
-  if(btnEl){
-    btnEl.disabled=true;
-    btnEl.classList.add('saving');
-    const sp=btnEl.querySelector('.save-spin');
-    if(sp)sp.style.display='inline-block';
-  }
-  try{await saveToCloud();}catch(e){showToast('❌ Saqlashda xato');}
-  if(btnEl){
-    btnEl.disabled=false;
-    btnEl.classList.remove('saving');
-    const sp=btnEl.querySelector('.save-spin');
-    if(sp)sp.style.display='none';
-  }
+// ── Loyiha bazasini olish ──
+function projBase(){
+  return ksDb.collection('users').doc(currentUser.uid).collection('projects').doc(currentProjectId);
 }
 
+// ── Tugma bosganda saqlash ──
+async function doSave(btnEl){
+  if(!currentUser||!currentProjectId){showToast('❌ Avval tizimga kiring');return;}
+  saveC();
+  saveToLocal();
+  if(btnEl){btnEl.disabled=true;btnEl.classList.add('saving');}
+  try{await saveToCloud();}catch(e){showToast('❌ Saqlashda xato');}
+  if(btnEl){btnEl.disabled=false;btnEl.classList.remove('saving');}
+}
+
+// ── LocalStorage ──
 function saveToLocal(){
-  if(!currentUser)return;
+  if(!currentUser||!currentProjectId)return;
   try{
     const s={cover:getCoverState(),chapters:CHS,curC,design:D,wordGoal,pgThemeName};
     const canvas=s.cover.canvas;delete s.cover.canvas;
-    localStorage.setItem(LS_KEY+'_'+currentUser.uid,JSON.stringify(s));
-    if(canvas)localStorage.setItem(LS_CV+'_'+currentUser.uid,canvas);
+    localStorage.setItem(LS_KEY+'_'+currentUser.uid+'_'+currentProjectId,JSON.stringify(s));
+    if(canvas)localStorage.setItem(LS_CV+'_'+currentUser.uid+'_'+currentProjectId,canvas);
+    localStorage.setItem('ks_pid_'+currentUser.uid,currentProjectId);
   }catch(e){}
 }
 
-function loadFromLocal(uid){
+function loadFromLocal(uid,pid){
   try{
-    const raw=localStorage.getItem(LS_KEY+'_'+uid);if(!raw)return false;
+    const raw=localStorage.getItem(LS_KEY+'_'+uid+'_'+pid);if(!raw)return false;
     const state=JSON.parse(raw);
-    const canvas=localStorage.getItem(LS_CV+'_'+uid)||'';
+    const canvas=localStorage.getItem(LS_CV+'_'+uid+'_'+pid)||'';
     applyFullState(state,canvas);return true;
   }catch(e){return false;}
 }
 
+// ── Cloud: saqlash ──
 async function saveToCloud(){
-  if(!currentUser)return;
-  const base=ksDb.collection('users').doc(currentUser.uid).collection('data');
-  try{
-    const cs=getCoverState();const canvas=cs.canvas;delete cs.canvas;
-    const batch=ksDb.batch();
-    batch.set(base.doc('cover'),cs);
-    batch.set(base.doc('chapters'),{list:CHS,curC,wordGoal});
-    batch.set(base.doc('design'),{...D,pgThemeName});
-    await batch.commit();
-    if(canvas&&canvas.length<900000)await base.doc('canvas').set({dataUrl:canvas});
-    showToast('✅ Saqlandi!');
-  }catch(e){console.warn('Cloud save:',e);}
+  if(!currentUser||!currentProjectId)return;
+  const base=projBase();
+  const cs=getCoverState();const canvas=cs.canvas;delete cs.canvas;
+  const title=document.getElementById('i-title').value||'Nomsiz loyiha';
+  const bgPrev=document.getElementById('cover').style.background||'';
+  const batch=ksDb.batch();
+  // top-level project meta (ro'yxat uchun)
+  batch.set(base,{title,bgPreview:bgPrev,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  // ma'lumotlar
+  const d=base.collection('data');
+  batch.set(d.doc('cover'),cs);
+  batch.set(d.doc('chapters'),{list:CHS,curC,wordGoal});
+  batch.set(d.doc('design'),{...D,pgThemeName});
+  await batch.commit();
+  if(canvas&&canvas.length<900000)await d.doc('canvas').set({dataUrl:canvas});
+  showToast('✅ Saqlandi!');
 }
 
-async function loadFromCloud(uid){
-  const base=ksDb.collection('users').doc(uid).collection('data');
+// ── Cloud: yuklash ──
+async function loadFromCloud(uid,pid){
+  const d=ksDb.collection('users').doc(uid).collection('projects').doc(pid).collection('data');
   try{
     const[cs,ch,ds,cvs]=await Promise.all([
-      base.doc('cover').get(),base.doc('chapters').get(),
-      base.doc('design').get(),base.doc('canvas').get()
+      d.doc('cover').get(),d.doc('chapters').get(),d.doc('design').get(),d.doc('canvas').get()
     ]);
     const state={};
     if(cs.exists)state.cover=cs.data();
-    if(ch.exists){const d=ch.data();state.chapters=d.list;state.curC=d.curC;state.wordGoal=d.wordGoal||0;}
-    if(ds.exists){const dd=ds.data();state.pgThemeName=dd.pgThemeName;const {pgThemeName:_pt,...rest}=dd;state.design=rest;}
+    if(ch.exists){const r=ch.data();state.chapters=r.list;state.curC=r.curC;state.wordGoal=r.wordGoal||0;}
+    if(ds.exists){const r=ds.data();state.pgThemeName=r.pgThemeName;const{pgThemeName:_p,...rest}=r;state.design=rest;}
     const canvas=cvs.exists?cvs.data().dataUrl:'';
     applyFullState(state,canvas);return true;
-  }catch(e){return false;}
+  }catch(e){console.warn('loadFromCloud:',e);return false;}
+}
+
+// ── Eski format (data/) dan ko'chirish ──
+async function migrateOldData(uid){
+  try{
+    const oldBase=ksDb.collection('users').doc(uid).collection('data');
+    const check=await oldBase.doc('cover').get();
+    if(!check.exists)return null;
+    const[cs,ch,ds,cvs]=await Promise.all([
+      oldBase.doc('cover').get(),oldBase.doc('chapters').get(),
+      oldBase.doc('design').get(),oldBase.doc('canvas').get()
+    ]);
+    const pid=newPid();
+    const base=ksDb.collection('users').doc(uid).collection('projects').doc(pid);
+    const title=cs.exists?(cs.data().title||'Birinchi loyiha'):'Birinchi loyiha';
+    const bgPrev=cs.exists?(cs.data().bg||''):'';
+    const batch=ksDb.batch();
+    batch.set(base,{title,bgPreview:bgPrev,updatedAt:firebase.firestore.FieldValue.serverTimestamp(),createdAt:firebase.firestore.FieldValue.serverTimestamp()});
+    const d=base.collection('data');
+    if(cs.exists)batch.set(d.doc('cover'),cs.data());
+    if(ch.exists)batch.set(d.doc('chapters'),ch.data());
+    if(ds.exists)batch.set(d.doc('design'),ds.data());
+    await batch.commit();
+    if(cvs.exists)await d.doc('canvas').set(cvs.data());
+    console.log('✅ Ko\'chirish bajarildi, pid:',pid);
+    return pid;
+  }catch(e){console.warn('Ko\'chirish xatosi:',e);return null;}
+}
+
+// ── Appni bo'sh holatga qaytarish ──
+function resetState(){
+  const cov=document.getElementById('cover');
+  cov.style.background='linear-gradient(135deg,#1a1a2e,#16213e,#0f3460)';
+  cov.style.color='';cov.style.fontFamily='';
+  [['i-title','cv-title'],['i-sub','cv-sub'],['i-quote','cv-quote'],['i-author','cv-author'],['i-pub','cv-pub']].forEach(([i,e])=>{
+    const inp=document.getElementById(i),el=document.getElementById(e);
+    if(inp)inp.value='';if(el)el.textContent='';
+  });
+  ctx.clearRect(0,0,cv.width,cv.height);
+  CHS=[{title:'Birinchi bob',html:''}];curC=0;wordGoal=0;
+  const wgi=document.getElementById('wg-inp');if(wgi)wgi.value='';
+  Object.assign(D,{fontFamily:"'Merriweather',serif",fontSize:'16px',lineHeight:'1.8',letterSpacing:'0px',textAlign:'left',color:'#e8e8f0',pageColor:'#1e1e2e',titleFont:"'Playfair Display',serif"});
+  const sl=document.getElementById('shadow-sl'),sv=document.getElementById('shadow-v');
+  if(sl){sl.value=8;if(sv)sv.textContent=8;}setCvShadow(8);
+  setPgTheme('kosmik',null);
+  renderCHL();loadC(0);syncDP();
+}
+
+// ═══ LOYIHALAR KUTUBXONASI ═══
+async function renderLibrary(){
+  const grid=document.getElementById('proj-grid');if(!grid)return;
+  grid.innerHTML='<div class="proj-loading">⏳ Yuklanmoqda...</div>';
+  try{
+    const snap=await ksDb.collection('users').doc(currentUser.uid)
+      .collection('projects').get();
+    // updatedAt bo'yicha sort (index kerak emas)
+    const docs=[...snap.docs].sort((a,b)=>{
+      const ta=a.data().updatedAt?.seconds||0, tb=b.data().updatedAt?.seconds||0;
+      return tb-ta;
+    });
+    grid.innerHTML='';
+    if(docs.length===0){
+      grid.innerHTML='<div class="proj-empty">Hali saqlangan loyiha yo\'q.<br>Muqova sahifasida ishlang va <b>Saqlash</b> tugmasini bosing!</div>';
+      return;
+    }
+    docs.forEach(doc=>{
+      const p={id:doc.id,...doc.data()};
+      const dateStr=p.updatedAt?new Date(p.updatedAt.seconds*1000).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric'}):'';
+      const isActive=p.id===currentProjectId;
+      const card=document.createElement('div');
+      card.className='proj-card'+(isActive?' proj-active':'');
+      card.innerHTML=`
+        <div class="proj-cover-prev" style="background:${p.bgPreview||'linear-gradient(135deg,#1a1a2e,#16213e,#0f3460)'}">
+          <span>${p.title||'Nomsiz'}</span>
+          ${isActive?'<div class="proj-badge">Ochiq</div>':''}
+        </div>
+        <div class="proj-info">
+          <div class="proj-title">${p.title||'Nomsiz loyiha'}</div>
+          <div class="proj-date">${dateStr?'🕐 '+dateStr:''}</div>
+        </div>
+        <div class="proj-acts">
+          <button class="btn pri" onclick="openProject('${p.id}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            ${isActive?'Ochiq':'Ochish'}
+          </button>
+          <button class="btn" title="O'chirish" onclick="deleteProject('${p.id}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </button>
+        </div>`;
+      grid.appendChild(card);
+    });
+  }catch(e){grid.innerHTML='<div class="proj-empty">❌ Xato yuz berdi</div>';}
+}
+
+async function openProject(id){
+  if(id===currentProjectId){
+    document.querySelector('.tab[onclick*="cover"]')?.click();return;
+  }
+  saveC();await saveToCloud().catch(()=>{});
+  currentProjectId=id;
+  localStorage.setItem('ks_pid_'+currentUser.uid,id);
+  resetState();
+  await loadFromCloud(currentUser.uid,id);
+  pushHistory();
+  document.querySelector('.tab[onclick*="cover"]')?.click();
+  showToast('✅ Loyiha ochildi');
+}
+
+async function createNewProject(){
+  saveC();await saveToCloud().catch(()=>{});
+  currentProjectId=newPid();
+  localStorage.setItem('ks_pid_'+currentUser.uid,currentProjectId);
+  resetState();
+  pushHistory();
+  document.querySelector('.tab[onclick*="cover"]')?.click();
+  showToast('✅ Yangi loyiha yaratildi');
+}
+
+async function deleteProject(id){
+  if(!confirm('Bu loyihani o\'chirasizmi? Bekor qilib bo\'lmaydi!'))return;
+  try{
+    const base=ksDb.collection('users').doc(currentUser.uid).collection('projects').doc(id);
+    const snap=await base.collection('data').get();
+    const batch=ksDb.batch();
+    snap.docs.forEach(d=>batch.delete(d.ref));
+    batch.delete(base);
+    await batch.commit();
+    if(id===currentProjectId){
+      const remaining=await ksDb.collection('users').doc(currentUser.uid).collection('projects').limit(1).get();
+      if(!remaining.empty){await openProject(remaining.docs[0].id);}
+      else{currentProjectId=newPid();localStorage.setItem('ks_pid_'+currentUser.uid,currentProjectId);resetState();}
+    }
+    renderLibrary();showToast('🗑️ Loyiha o\'chirildi');
+  }catch(e){showToast('❌ Xato yuz berdi');}
 }
 
 // ═══ HELPERS ═══
@@ -627,14 +768,33 @@ ksAuth.onAuthStateChanged(async user=>{
   const overlay=document.getElementById('ks-loading');
   if(!user){window.location.replace('auth.html');return;}
   currentUser=user;
+
+  // Nav: avatar + ism
   const av=document.getElementById('nav-av'),nm=document.getElementById('nav-nm');
-  if(av){
-    if(user.photoURL)av.innerHTML=`<img src="${user.photoURL}" alt=""/>`;
-    else av.textContent=(user.displayName||user.email||'?')[0].toUpperCase();
-  }
+  if(av){if(user.photoURL)av.innerHTML=`<img src="${user.photoURL}" alt=""/>`;else av.textContent=(user.displayName||user.email||'?')[0].toUpperCase();}
   if(nm)nm.textContent=user.displayName||user.email||'';
-  loadFromLocal(user.uid);
-  try{await loadFromCloud(user.uid);}catch(e){}
+
+  // Joriy loyiha ID ni aniqlash
+  let pid=localStorage.getItem('ks_pid_'+user.uid);
+
+  // LocalStorage dan tez yuklash
+  if(pid){currentProjectId=pid;loadFromLocal(user.uid,pid);}
+
+  try{
+    if(!pid){
+      // Eski format (data/) mavjudmi? — ko'chirish
+      pid=await migrateOldData(user.uid);
+      if(!pid){
+        // Yangi foydalanuvchi: projects kolleksiyasini tekshir
+        const snap=await ksDb.collection('users').doc(user.uid).collection('projects').limit(1).get();
+        pid=snap.empty?newPid():snap.docs[0].id;
+      }
+      currentProjectId=pid;
+      localStorage.setItem('ks_pid_'+user.uid,pid);
+    }
+    await loadFromCloud(user.uid,pid);
+  }catch(e){console.warn('Init load:',e);}
+
   if(overlay)overlay.remove();
   pushHistory();
 });
